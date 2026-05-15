@@ -160,8 +160,13 @@ def _select_market(session: requests.Session, market_slug: str | None) -> dict[s
         )
         resp.raise_for_status()
         markets = resp.json() or []
-        if markets:
-            return markets[0]
+        exact_matches = [
+            market
+            for market in markets
+            if str(market.get("slug", "")).strip().lower() == market_slug.strip().lower()
+        ]
+        if exact_matches:
+            return exact_matches[0]
         raise RuntimeError(f"No market found for slug: {market_slug}")
 
     resp = session.get(
@@ -203,7 +208,21 @@ def _extract_wallet_id(trade: dict[str, Any]) -> str:
     return "unknown_wallet"
 
 
-def _normalize_trades(trades: list[dict[str, Any]]) -> pd.DataFrame:
+def _slug_prefix(slug: str) -> str:
+    """
+    Return a stable slug prefix by stripping a trailing numeric time bucket.
+    Example: btc-updown-5m-1778853900 -> btc-updown-5m
+    """
+    parts = slug.strip().lower().split("-")
+    if parts and parts[-1].isdigit():
+        return "-".join(parts[:-1])
+    return slug.strip().lower()
+
+
+def _normalize_trades(
+    trades: list[dict[str, Any]],
+    min_rows: int = 200,
+) -> pd.DataFrame:
     """
     Convert raw Polymarket trade objects into the pipeline schema.
     """
@@ -243,9 +262,10 @@ def _normalize_trades(trades: list[dict[str, Any]]) -> pd.DataFrame:
     df = df[df["volume"] > 0]
     df = df.sort_values("timestamp").drop_duplicates().reset_index(drop=True)
 
-    if len(df) < 200:
+    if len(df) < min_rows:
         raise RuntimeError(
-            f"Insufficient live data for training ({len(df)} rows). Increase max_trades."
+            f"Insufficient live data for training ({len(df)} rows). "
+            f"Increase max_trades or lower min_rows (current={min_rows})."
         )
 
     return df
@@ -254,6 +274,7 @@ def _normalize_trades(trades: list[dict[str, Any]]) -> pd.DataFrame:
 def fetch_real_polymarket_data(
     market_slug: str | None = None,
     max_trades: int = 5000,
+    min_rows: int = 200,
     allow_simulated_fallback: bool = False,
 ) -> pd.DataFrame:
     """
@@ -271,21 +292,51 @@ def fetch_real_polymarket_data(
 
     try:
         with requests.Session() as session:
-            market = _select_market(session, market_slug=market_slug)
-            token_ids = _parse_token_ids(market.get("clobTokenIds"))
-            if not token_ids:
-                raise RuntimeError("Selected market does not expose CLOB token ids")
+            params = {}
+            target_slug = (market_slug or "").strip().lower()
 
-            token_id = token_ids[0]
-            logger.info(
-                "Resolved market: "
-                f"question={market.get('question', 'unknown')} | "
-                f"slug={market.get('slug', 'unknown')} | token={token_id}"
-            )
+            if market_slug:
+                try:
+                    market = _select_market(session, market_slug=market_slug)
+                    token_ids = _parse_token_ids(market.get("clobTokenIds"))
+                    if not token_ids:
+                        raise RuntimeError("Selected market does not expose CLOB token ids")
+
+                    token_id = token_ids[0]
+                    target_slug = str(market.get("slug", "")).strip().lower()
+                    params["market"] = token_id
+                    logger.info(
+                        "Resolved market via Gamma: "
+                        f"question={market.get('question', 'unknown')} | "
+                        f"slug={market.get('slug', 'unknown')} | token={token_id}"
+                    )
+                except RuntimeError as e:
+                    logger.warning(
+                        "Gamma slug lookup failed; using slug-only trade filtering. "
+                        f"slug={market_slug} | error={e}"
+                    )
+            else:
+                market = _select_market(session, market_slug=None)
+                token_ids = _parse_token_ids(market.get("clobTokenIds"))
+                if not token_ids:
+                    raise RuntimeError("Selected market does not expose CLOB token ids")
+                token_id = token_ids[0]
+                target_slug = str(market.get("slug", "")).strip().lower()
+                params["market"] = token_id
+                logger.info(
+                    "Resolved market via Gamma: "
+                    f"question={market.get('question', 'unknown')} | "
+                    f"slug={market.get('slug', 'unknown')} | token={token_id}"
+                )
+
+            # data-api /trades can return global trades; fetch a wider window and
+            # enforce market matching by trade.slug for correctness.
+            request_limit = max(max_trades * 10, 5000)
+            params["limit"] = request_limit
 
             trade_resp = session.get(
                 f"{DATA_API_BASE}/trades",
-                params={"market": token_id, "limit": max_trades},
+                params=params,
                 timeout=20,
             )
             trade_resp.raise_for_status()
@@ -294,7 +345,49 @@ def fetch_real_polymarket_data(
             if not isinstance(trades, list) or not trades:
                 raise RuntimeError("No trades returned from Polymarket data API")
 
-            df = _normalize_trades(trades)
+            if not target_slug:
+                raise RuntimeError("Could not resolve target slug for trade filtering")
+
+            filtered_trades = [
+                trade
+                for trade in trades
+                if str(trade.get("slug", "")).strip().lower() == target_slug
+            ]
+            if not filtered_trades:
+                # Handle stale time-bucket slugs by rolling over to latest matching prefix.
+                prefix = _slug_prefix(target_slug)
+                candidates = [
+                    trade
+                    for trade in trades
+                    if _slug_prefix(str(trade.get("slug", "")).strip().lower()) == prefix
+                ]
+
+                if candidates:
+                    latest_slug = max(
+                        candidates,
+                        key=lambda x: float(x.get("timestamp", 0) or 0),
+                    ).get("slug")
+                    latest_slug = str(latest_slug).strip().lower()
+                    filtered_trades = [
+                        trade
+                        for trade in trades
+                        if str(trade.get("slug", "")).strip().lower() == latest_slug
+                    ]
+                    logger.warning(
+                        "No exact trades for requested slug; using latest matching bucket. "
+                        f"requested={target_slug} -> resolved={latest_slug}"
+                    )
+
+                if not filtered_trades:
+                    raise RuntimeError(
+                        "No trades matched the selected market slug. "
+                        "Try increasing max_trades or choose a higher-volume market."
+                    )
+
+            # Keep most recent N trades for this market before normalization.
+            filtered_trades = filtered_trades[:max_trades]
+
+            df = _normalize_trades(filtered_trades, min_rows=min_rows)
 
             logger.info(
                 f"Live data fetched: shape={df.shape}, "

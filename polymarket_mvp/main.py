@@ -49,21 +49,148 @@ RUN THIS FILE:
 import sys
 import os
 import pandas as pd
-import numpy as np
 
 # Ensure imports work when running from project root
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from monitoring import get_logger, SignalTracker, MetricsCollector
+from monitoring import get_logger
 from data_ingestion import fetch_real_polymarket_data
 from feature_engineering import engineer_features
 from labels import create_labels
 from wallet_tracking import compute_wallet_profitability, add_smart_money_signal
 from model import train_model, FEATURE_COLS
 from backtesting import run_backtest
-from dashboard import plot_dashboard
+from dashboard import plot_dashboard, plot_multi_slug_dashboard
 
 logger = get_logger("Main")
+
+
+def _run_single_market_pipeline(
+  market_slug: str | None,
+  max_trades: int,
+  min_rows: int,
+  allow_simulated_fallback: bool,
+) -> dict:
+  """
+  Run the end-to-end pipeline for a single market and return summary metrics.
+  """
+  df = fetch_real_polymarket_data(
+    market_slug=market_slug,
+    max_trades=max_trades,
+    min_rows=min_rows,
+    allow_simulated_fallback=allow_simulated_fallback,
+  )
+
+  rows_fetched = len(df)
+  unique_wallets = int(df["wallet_id"].nunique())
+  ts_min = pd.to_datetime(df["timestamp"].min(), unit="s", utc=True)
+  ts_max = pd.to_datetime(df["timestamp"].max(), unit="s", utc=True)
+
+  df = engineer_features(df)
+  df = create_labels(df)
+  wallet_stats = compute_wallet_profitability(df)
+  df = add_smart_money_signal(df, wallet_stats)
+
+  enhanced_features = FEATURE_COLS + ["smart_money_signal"]
+  model, test_df, _ = train_model(df, feature_cols=enhanced_features)
+
+  tracker, metrics = run_backtest(
+    test_df,
+    model,
+    smart_money_available=True,
+  )
+  summary = tracker.summary()
+
+  slug_label = market_slug or "auto-selected"
+  slug_for_file = slug_label.replace("/", "-").replace(" ", "-")[:80]
+  dashboard_path = f"/app/output/dashboard_{slug_for_file}.png"
+  plot_dashboard(tracker, metrics, test_df, save_path=dashboard_path)
+
+  total_trades = int(summary.get("total_buys", 0))
+  total_pnl = float(summary.get("total_pnl", 0.0))
+
+  return {
+    "market_slug": slug_label,
+    "status": "ok",
+    "rows_fetched": rows_fetched,
+    "unique_wallets": unique_wallets,
+    "time_start_utc": str(ts_min),
+    "time_end_utc": str(ts_max),
+    "total_signals": int(summary.get("total_signals", 0)),
+    "total_trades": total_trades,
+    "win_rate": float(summary.get("win_rate", 0.0)),
+    "total_pnl": total_pnl,
+    "avg_pnl_per_trade": (total_pnl / total_trades) if total_trades > 0 else 0.0,
+    "dashboard_path": dashboard_path,
+  }
+
+
+def run_multi_slug_pipeline(
+  market_slugs: list[str],
+  max_trades: int,
+  min_rows: int,
+  allow_simulated_fallback: bool,
+) -> pd.DataFrame:
+  """
+  Run the full pipeline per slug and aggregate results into a comparison table.
+  """
+  print("\n" + "=" * 70)
+  print("  POLYMARKET MVP - MULTI-SLUG EVALUATION")
+  print("=" * 70)
+  print(f"\n  Markets to evaluate: {len(market_slugs)}")
+  print(f"  Slugs: {market_slugs}")
+
+  results: list[dict] = []
+
+  for idx, slug in enumerate(market_slugs, start=1):
+    print("\n" + "─" * 70)
+    print(f"  MARKET {idx}/{len(market_slugs)}: {slug}")
+    print("─" * 70)
+
+    try:
+      result = _run_single_market_pipeline(
+        market_slug=slug,
+        max_trades=max_trades,
+        min_rows=min_rows,
+        allow_simulated_fallback=allow_simulated_fallback,
+      )
+      results.append(result)
+      print(
+        f"  ✓ rows={result['rows_fetched']} | trades={result['total_trades']} | "
+        f"win_rate={result['win_rate']:.1%} | pnl=${result['total_pnl']:.2f}"
+      )
+    except Exception as e:
+      logger.exception(f"Pipeline failed for slug={slug}")
+      print(f"  ✗ Failed: {e}")
+      results.append(
+        {
+          "market_slug": slug,
+          "status": "failed",
+          "error": str(e),
+        }
+      )
+
+  results_df = pd.DataFrame(results)
+  csv_path = "/app/output/multi_slug_results.csv"
+  results_df.to_csv(csv_path, index=False)
+
+  plot_path = plot_multi_slug_dashboard(results_df, save_path="/app/output/multi_slug_dashboard.png")
+
+  print("\n" + "=" * 70)
+  print("  MULTI-SLUG RESULTS TABLE")
+  print("=" * 70)
+  display_cols = [
+    col for col in [
+      "market_slug", "status", "rows_fetched", "total_trades",
+      "win_rate", "total_pnl", "avg_pnl_per_trade"
+    ] if col in results_df.columns
+  ]
+  print(results_df[display_cols].to_string(index=False))
+
+  print(f"\n  ✓ Results table saved: {csv_path}")
+  print(f"  ✓ Comparison dashboard saved: {plot_path}")
+
+  return results_df
 
 
 def run_pipeline():
@@ -76,6 +203,22 @@ def run_pipeline():
     print("  Quantitative Strategy Pipeline")
     print("=" * 70)
 
+    market_slugs_env = os.getenv("POLYMARKET_MARKET_SLUGS", "")
+    market_slugs = [s.strip() for s in market_slugs_env.split(",") if s.strip()]
+    max_trades = int(os.getenv("POLYMARKET_MAX_TRADES", "5000"))
+    min_rows = int(os.getenv("POLYMARKET_MIN_ROWS", "200"))
+    allow_simulated_fallback = os.getenv("ALLOW_SIMULATED_FALLBACK", "false").lower() == "true"
+
+    # Multi-market mode: evaluate each slug independently and compare results.
+    if market_slugs:
+        results_df = run_multi_slug_pipeline(
+            market_slugs=market_slugs,
+            max_trades=max_trades,
+            min_rows=min_rows,
+            allow_simulated_fallback=allow_simulated_fallback,
+        )
+        return results_df
+
     # =========================================================================
     # STEP 1: DATA INGESTION
     # =========================================================================
@@ -84,12 +227,11 @@ def run_pipeline():
     print("─" * 70)
 
     market_slug = os.getenv("POLYMARKET_MARKET_SLUG")
-    max_trades = int(os.getenv("POLYMARKET_MAX_TRADES", "5000"))
-    allow_simulated_fallback = os.getenv("ALLOW_SIMULATED_FALLBACK", "false").lower() == "true"
 
     df = fetch_real_polymarket_data(
         market_slug=market_slug,
         max_trades=max_trades,
+      min_rows=min_rows,
         allow_simulated_fallback=allow_simulated_fallback,
     )
 
@@ -102,7 +244,7 @@ def run_pipeline():
     print(f"  ✓ Columns: {list(df.columns)}")
     print(f"  ✓ Price range: [{df['price'].min():.4f}, {df['price'].max():.4f}]")
     print(f"  ✓ Unique wallets: {df['wallet_id'].nunique()}")
-    print(f"\n  Sample data:")
+    print("\n  Sample data:")
     print(df.head(3).to_string(index=False))
 
     # =========================================================================
@@ -116,7 +258,7 @@ def run_pipeline():
     feature_cols_display = ["momentum", "rolling_volume", "rolling_volatility",
                             "volume_momentum", "price_zscore"]
     print(f"\n  ✓ Engineered {len(feature_cols_display)} features")
-    print(f"\n  Feature statistics:")
+    print("\n  Feature statistics:")
     print(df[feature_cols_display].describe().round(4).to_string())
 
     # =========================================================================
@@ -129,7 +271,7 @@ def run_pipeline():
     df = create_labels(df)
     label_dist = df["label"].value_counts()
     print(f"\n  ✓ Labels created (predicting {5}-step forward return)")
-    print(f"  ✓ Label distribution:")
+    print("  ✓ Label distribution:")
     print(f"    Class 0 (HOLD): {label_dist.get(0, 0)} ({label_dist.get(0, 0)/len(df):.1%})")
     print(f"    Class 1 (BUY):  {label_dist.get(1, 0)} ({label_dist.get(1, 0)/len(df):.1%})")
     print(f"  ✓ Future return stats: mean={df['future_return'].mean():.5f}, "
@@ -146,7 +288,7 @@ def run_pipeline():
     df = add_smart_money_signal(df, wallet_stats)
     print(f"\n  ✓ Computed profitability for {len(wallet_stats)} wallets")
     print(f"  ✓ Smart money signal active in {df['smart_money_signal'].mean():.1%} of rows")
-    print(f"\n  Top 5 wallets by avg return:")
+    print("\n  Top 5 wallets by avg return:")
     print(wallet_stats.head(5).to_string(index=False))
 
     # =========================================================================
@@ -162,7 +304,7 @@ def run_pipeline():
 
     print(f"\n  ✓ Model trained on {int(len(df) * 0.75)} samples")
     print(f"  ✓ Testing on {int(len(df) * 0.25)} samples")
-    print(f"\n  Feature Importance:")
+    print("\n  Feature Importance:")
     print(importance.to_string(index=False))
 
     # =========================================================================
@@ -178,7 +320,7 @@ def run_pipeline():
     )
 
     summary = tracker.summary()
-    print(f"\n  ✓ Backtest complete")
+    print("\n  ✓ Backtest complete")
     print(f"  ✓ Total signals: {summary['total_signals']}")
     print(f"  ✓ Total trades (BUY): {summary['total_buys']}")
     print(f"  ✓ Win rate: {summary['win_rate']:.1%}")
@@ -282,4 +424,7 @@ def run_pipeline():
 
 
 if __name__ == "__main__":
-    tracker, metrics, model, test_df = run_pipeline()
+  # run_pipeline returns either:
+  # - tuple(tracker, metrics, model, test_df) in single-market mode
+  # - DataFrame in multi-slug mode
+  _ = run_pipeline()
