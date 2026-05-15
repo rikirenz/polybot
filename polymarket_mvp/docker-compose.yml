@@ -1,0 +1,12 @@
+services:
+  strategy:
+    build: .
+    container_name: polymarket-mvp
+    volumes:
+      - ./output:/app/output
+      - .:/app
+    environment:
+      - PYTHONUNBUFFERED=1
+      - POLYMARKET_MARKET_SLUG=
+      - POLYMARKET_MAX_TRADES=5000
+      - ALLOW_SIMULATED_FALLBACK=false
