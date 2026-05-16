@@ -221,3 +221,89 @@ class TestFetchTradesForWallet:
         assert len(trades) == 2
         assert trades[0].side.value == "BUY"
         assert trades[1].price == 0.40
+
+
+class TestFetchTags:
+    """Verify fetching available tags from Gamma API."""
+
+    @pytest.mark.asyncio
+    async def test_returns_parsed_tags(self, ingestion_config):
+        """Tags response is parsed into id/label/slug dicts."""
+        from src.client import fetch_tags
+
+        mock_response = httpx.Response(
+            200,
+            json=[
+                {
+                    "id": "101611",
+                    "label": "Altcoins",
+                    "slug": "altcoins",
+                    "createdAt": "2025-01-01T00:00:00Z",
+                    "updatedAt": "2025-01-01T00:00:00Z",
+                    "requiresTranslation": False,
+                },
+                {
+                    "id": "833",
+                    "label": "ETF",
+                    "slug": "etf",
+                    "createdAt": "2024-01-01T00:00:00Z",
+                    "updatedAt": "2024-01-01T00:00:00Z",
+                    "requiresTranslation": False,
+                },
+            ],
+        )
+
+        with patch("src.client.make_request", return_value=mock_response):
+            tags = await fetch_tags(ingestion_config)
+
+        assert len(tags) == 2
+        assert tags[0] == {"id": "101611", "label": "Altcoins", "slug": "altcoins"}
+        assert tags[1] == {"id": "833", "label": "ETF", "slug": "etf"}
+
+
+class TestFetchResolvedMarketsWithCategory:
+    """Verify client-side category filtering."""
+
+    @pytest.mark.asyncio
+    async def test_filters_markets_by_category(self, ingestion_config):
+        """Only markets matching the requested category are returned."""
+        from src.client import fetch_resolved_markets
+
+        mock_response = httpx.Response(
+            200,
+            json={
+                "markets": [
+                    {
+                        "conditionId": "0x111",
+                        "question": "BTC to 200k?",
+                        "slug": "btc-200k",
+                        "active": False,
+                        "closed": True,
+                        "volume": "900000",
+                        "outcomes": '["Yes","No"]',
+                        "outcomePrices": '["0.1","0.9"]',
+                        "category": "Crypto",
+                    },
+                    {
+                        "conditionId": "0x222",
+                        "question": "Will president resign?",
+                        "slug": "president-resign",
+                        "active": False,
+                        "closed": True,
+                        "volume": "500000",
+                        "outcomes": '["Yes","No"]',
+                        "outcomePrices": '["0.3","0.7"]',
+                        "category": "US-current-affairs",
+                    },
+                ],
+                "next_cursor": None,
+            },
+        )
+
+        with patch("src.client.make_request", return_value=mock_response):
+            markets = await fetch_resolved_markets(
+                ingestion_config, limit=10, category="Crypto"
+            )
+
+        assert len(markets) == 1
+        assert markets[0].condition_id == "0x111"

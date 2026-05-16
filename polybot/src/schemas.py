@@ -50,6 +50,9 @@ class Market(BaseModel):
     outcome_prices: str = Field(
         ..., description='JSON string array, e.g. \'["0.20","0.80"]\''
     )
+    category: str | None = Field(
+        None, description="Market category (e.g. Crypto, Sports, Tech)"
+    )
 
     @field_validator("condition_id")
     @classmethod

@@ -18,72 +18,71 @@ The payoff profile: lose small many times, win big when it hits.
 
 ---
 
-## Current State
+## Current State (15 tests passing)
 
 ### Done ✅
 
 | What | Files | Notes |
 |------|-------|-------|
 | Project skeleton | `Dockerfile`, `docker-compose.yml`, `pyproject.toml` | `docker compose run --rm testrunner` works |
-| Config system | `src/config.py` | Env-var based, no hardcoded secrets |
-| Data contracts | `src/schemas.py` | `Market`, `Trade`, `IngestionCheckpoint` — matches real API shapes |
-| API reference doc | `docs/api_reference.md` | Documented actual Gamma/Data/CLOB API response formats |
-| Ingestion parsing | `src/ingestion.py` | Parses raw API JSON → validated models, skips malformed data |
-| Checkpointing | `src/ingestion.py` | Save/load offset-based checkpoints for resumable fetches |
-| Tests (9 passing) | `tests/test_ingestion.py` | Parsing, normalization, error handling, checkpointing |
-| Structured logging | `src/logging.py` | structlog setup, configurable level |
+| Config system | `src/config.py` | Env-var based, includes all 3 API base URLs |
+| Data contracts | `src/schemas.py` | `Market` (with category), `Trade`, `IngestionCheckpoint` |
+| API reference doc | `docs/api_reference.md` | Documented actual API response formats |
+| Ingestion parsing | `src/ingestion.py` | Parses raw API JSON → validated models |
+| Checkpointing | `src/ingestion.py` | Save/load offset-based checkpoints |
+| HTTP client | `src/client.py` | Fetches markets, holders, trades, tags |
+| Category filtering | `src/client.py` | Client-side filter (API doesn't support server-side) |
+| Structured logging | `src/logging.py` | structlog setup |
+| Tests | `tests/test_ingestion.py`, `tests/test_client.py` | 15 tests, all passing |
 
-### Next Up 🔜
+### API Findings (from hitting real endpoints)
 
-**Step 1b: HTTP client layer for ingestion**
+- **Gamma API** `GET /markets?closed=true` — returns markets with a `category` field
+- Categories found: `Crypto`, `Sports`, `Tech`, `US-current-affairs`, `Pop-Culture`, `Coronavirus`
+- No server-side category filter — we filter client-side after fetch
+- **Gamma API** `GET /tags` — only 50 niche tags, not useful for broad filtering
+- **Data API** `GET /trades`, `/holders`, `/positions` — all public, no auth needed
+- Pagination: Gamma uses `next_cursor`, Data API uses `offset`/`limit`
 
-The fetching strategy (agreed upon):
+### Client Functions Available
 
-```
-1. Fetch resolved markets from Gamma API
-   GET gamma-api.polymarket.com/markets?closed=true&limit=100
-
-2. Filter to "upset" markets — where the winning outcome was low-probability
-   (winner's price was < 0.30 for most of the market's life)
-   Use CLOB API GET /prices-history or infer from trade prices
-
-3. For upset markets, find who held the winning side
-   GET data-api.polymarket.com/holders?market=<conditionId>
-
-4. For those wallets, fetch their full closed position history
-   GET data-api.polymarket.com/closed-positions?user=<wallet>
-
-5. Keep wallets that show a PATTERN of contrarian wins (not one-offs)
-
-6. For kept wallets, fetch all their trades
-   GET data-api.polymarket.com/trades?user=<wallet>
+```python
+await fetch_tags(config)                                    # discover tags
+await fetch_resolved_markets(config, limit=50, category="Crypto")  # filtered markets
+await fetch_holders("0xconditionId", config)                # top holders per market
+await fetch_trades_for_wallet("0xwallet", config)           # all trades for a wallet
 ```
 
-Implementation needs:
-- httpx async client with retry (tenacity) and rate limiting
-- Pagination handling (cursor for Gamma, offset for Data API)
-- Resume from checkpoint on failure
-- Store raw data to DB (staging table)
+---
+
+## Next Up 🔜
+
+**Step 1c: "Upset detection" — find markets where the unlikely outcome won**
+
+Logic needed:
+1. Take resolved markets (fetched above)
+2. Look at `outcomePrices` — these are final prices (winner = ~1.0, loser = ~0.0)
+3. But we need the HISTORICAL price to know if it was an upset
+4. Options:
+   - Use CLOB API `GET /prices-history?token=<id>` to get price over time
+   - Or: fetch trades for the market and look at early trade prices
+   - Simpler: if the winning outcome's final price is 1.0 but early trades
+     were at 0.10-0.30, that's an upset
+
+After upset detection:
+- `GET /holders` on upset markets → find who held the winning (unlikely) side
+- `GET /closed-positions` per wallet → check if they're consistently profitable
+- `GET /trades` per profitable wallet → raw data for ML features
 
 ### Later Steps
 
 | Step | Module | Description |
 |------|--------|-------------|
-| 2 | `wallet_tracking.py` | Per-wallet metrics: contrarian win rate, avg entry price vs resolution, consistency |
-| 3 | `feature_engineering.py` | ML features: entry timing, position sizing, market selection patterns |
+| 2 | `wallet_tracking.py` | Per-wallet metrics: contrarian win rate, avg entry price, consistency |
+| 3 | `feature_engineering.py` | ML features: entry timing, position sizing, market selection |
 | 4 | `labels.py` | Binary label: "contrarian sharp wallet" vs noise |
 | 5 | `model.py` | Classifier with time-series-aware splits |
 | 6 | `backtesting.py` | Simulate following model signals at small scale |
-
----
-
-## APIs We Use
-
-| API | Base URL | Auth | Purpose |
-|-----|----------|------|---------|
-| Gamma API | `gamma-api.polymarket.com` | None | Market discovery (resolved, high-volume) |
-| Data API | `data-api.polymarket.com` | None | Trades, positions, holders |
-| CLOB API | `clob.polymarket.com` | None (public endpoints) | Price history |
 
 ---
 
@@ -92,18 +91,16 @@ Implementation needs:
 ```bash
 # Run all tests
 docker compose run --rm testrunner
-
-# (Future) Run ingestion
-docker compose run --rm ingestion
 ```
 
 ---
 
 ## Key Decisions Made
 
-1. **TDD approach** — tests written before implementation
-2. **Data API for trade history** (not CLOB API which requires auth for user trades)
-3. **Contrarian edge thesis** — we specifically target wallets buying low-prob outcomes
-4. **Offset pagination** for Data API, cursor pagination for Gamma API
-5. **Checkpointing** — ingestion is resumable if interrupted
-6. **Malformed data is skipped** with warning logs, not crashes
+1. **TDD approach** — tests before implementation, always
+2. **Data API for trade history** (public, no auth needed)
+3. **Contrarian edge thesis** — target wallets buying low-prob outcomes
+4. **Client-side category filtering** — API doesn't support it server-side
+5. **Offset pagination** for Data API, cursor for Gamma API
+6. **Checkpointing** — ingestion is resumable if interrupted
+7. **Malformed data is skipped** with warning logs, not crashes

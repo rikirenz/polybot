@@ -55,6 +55,7 @@ def parse_markets_response(
                 volume=item["volume"],
                 outcomes=item["outcomes"],
                 outcome_prices=item["outcomePrices"],
+                category=item.get("category"),
             )
             markets.append(market)
         except (KeyError, ValueError) as e:
