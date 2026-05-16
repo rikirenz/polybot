@@ -1,0 +1,10 @@
+services:
+  testrunner:
+    build: .
+    command: pytest
+    environment:
+      - ENVIRONMENT=local
+      - DATABASE_URL=sqlite:///test_polybot.db
+      - LOG_LEVEL=DEBUG
+    volumes:
+      - .:/app
